@@ -15,7 +15,7 @@
 // https://RandomNerdTutorials.com
 // https://github.com/zhouhan0126/WIFIMANAGER-ESP32 (patch required)
 // https://github.com/bartlomiejcieszkowski/Micro-RTSP/tree/bcieszko-multi-client-rtsp
-// 
+//
 #define NO_GLOBAL_ARDUINOOTA
 #include <ArduinoOTA.h>
 #include <WiFiManager.h>  // Need to patch to transfer to cpp some duplicated definitions with WebServer.h, make connectWifi public and change HTTP_HEAD to _HTTP_HEAD
@@ -49,12 +49,15 @@
 #define EEPROM_ORIENTATION_ADDRESS 0
 #define EEPROM_ORIENTATION_FLIP_MASK 0x1
 #define EEPROM_ORIENTATION_MIRROR_MASK 0x2
+#define EEPROM_FRAMESIZE_ADDRESS 1
+#define EEPROM_FRAMESIZE_MASK 0xF  //four bits
 
 // Web server port - port du serveur web
 #define WEB_SERVER_PORT 80
 #define URI_STATIC_JPEG "/jpg/image.jpg"
 #define URI_FLASH "/flash"
 #define URI_ORIENTATION "/orientation"
+#define URI_FRAMESIZE "/framesize"
 #define URI_WIFI "/reset"
 #define URI_REBOOT "/reboot"
 #define URI_OTA "/ota"
@@ -74,7 +77,11 @@ WebServer server ( WEB_SERVER_PORT );
 hw_timer_t *watchdog = NULL;
 
 #define IMAGE_COMPRESSION 10   //0-63 lower number means higher quality - Plus de chiffre est petit, meilleure est la qualité de l'image, plus gros est le fichier
-#define CAMERA_SNAPSHOT_PERIOD 200
+#define CAMERA_SNAPSHOT_PERIOD 100
+
+static int imWidth[] =  {160,160,160,240,320,400,640,800,1024,1280,1600 };
+static int imHeight[] = {120,120,120,176,240,296,480,600, 768,1024,1200 };
+int framesizeint = 0;
 
 #define TAG "esp32-cam"
 
@@ -181,6 +188,7 @@ public:
   MyRtspServer(u_short width, u_short height, uint16_t port = 554): m_streamer(width, height), m_rtspServer(port) { m_lastImage = millis(); m_rtspServer.setNoDelay(true); }
   void begin() { m_rtspServer.begin(); }
   void end() { m_rtspServer.end(); }
+  void setSize(u_short width, u_short height) { m_streamer.setSize(width, height); }
   void setFrameRate(uint32_t msecPerFrame) { m_msecPerFrame = msecPerFrame; }
   int clientCount() {
     int count = 0;
@@ -286,6 +294,32 @@ static void orientation_handler() {
     server.send(200);
 }
 
+static void framesize_handler() {
+    //const char * param = server.arg("framesize").c_str();
+    String params = server.arg("framesize");
+    //Serial.printf("Received framesize param: %s \n", param);
+    Serial.printf("\nString value: %s", params);
+    byte val = 0x0;
+    byte readVal = EEPROM.read(EEPROM_FRAMESIZE_ADDRESS);
+    if (params == "1") { val = 0x1; }
+    else if (params == "3") { val = 0x3; }
+    else if (params == "4") { val = 0x4; }
+    else if (params == "5") { val = 0x5; }
+    else if (params == "6") { val = 0x6; }
+    //else if (params == "7") { val = 0x7; }
+    else if (params == "8") { val = 0x8; }
+    else if (params == "9") { val = 0x9; }
+    else if (params == "10") { val = 0xA; }
+    if ((readVal & EEPROM_FRAMESIZE_MASK) != val) {
+        EEPROM.write(EEPROM_FRAMESIZE_ADDRESS, val);
+        EEPROM.commit();
+        Serial.printf("\nRead value: %u", readVal);
+        Serial.printf("\nReceived value: %u", val);
+        Serial.printf("\nComitting EEPROM value: %u", (readVal | (val << 2)));
+    }
+    server.send(200);
+}
+
 static void wifi_handler() {
     esp_wifi_restore();
     esp_restart();
@@ -375,6 +409,7 @@ F("<html>"
     "<ul>"
       "<li>Led on/off/toggle: " URI_FLASH "?action=[on|off|toggle]</li>"
       "<li>Flip/Mirror camera: " URI_ORIENTATION "?mirror=[0|false|1|true]&flip=[0|false|1|true]</li>"
+      "<li>Framesize camera: " URI_FRAMESIZE "?framesize=[0,3-6,8-10] (reboot needed)</li>"
       "<li>Snapshot JPEG: " URI_STATIC_JPEG "</li>"
       "<li>Reboot: " URI_REBOOT "</li>"
       "<li>Reset Wifi: " URI_WIFI "</li>"
@@ -389,6 +424,7 @@ F("<html>"
 
 static void status_handler() {
     byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
+    byte fs = EEPROM.read(EEPROM_FRAMESIZE_ADDRESS);
     int64_t time = esp_timer_get_time();
     String info = "{"
     "\"version\":\"" VERSION "\","
@@ -396,6 +432,7 @@ static void status_handler() {
     "\"ledTimer\":\"" + String(MAX(0, int((ledOnTimer - time) / 1000000))) + "\","
     "\"flip\":\"" + String(val&(EEPROM_ORIENTATION_FLIP_MASK)?"1":"0") + "\","
     "\"mirror\":\"" + String(val&(EEPROM_ORIENTATION_MIRROR_MASK)?"1":"0") + "\","
+    "\"framesize\":\"" + (fs&EEPROM_FRAMESIZE_MASK) + "\","
     "\"ssid\":\"" + WiFi.SSID() + "\","
     "\"rssi\":\"" + String(WiFi.RSSI()) + "\","
     "\"ip\":\"" + WiFi.localIP().toString() + "\","
@@ -496,7 +533,8 @@ F("<html>"
         "</tr>"
       "</tbody>"
     "</table>"
-    "<a href=\"" URI_USAGE "\">API Usage</a>"
+    "<a href=\"" URI_USAGE "\">API Usage</a><br/>"
+    "<a href=\"" URI_STATUS "\">Status</a>"
   "</body>"
 "</html>");
     server.send(200, "text/html", info);
@@ -523,6 +561,7 @@ void startCameraServer() {
     server.on(URI_STATIC_JPEG, capture_handler);
     server.on(URI_FLASH, led_handler);
     server.on(URI_ORIENTATION, orientation_handler);
+    server.on(URI_FRAMESIZE, framesize_handler);
     server.on(URI_WIFI, wifi_handler);
     server.on(URI_REBOOT, reboot_handler);
     server.on(URI_OTA, ota_handler);
@@ -589,7 +628,7 @@ void setup() {
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = 20000000;       //XCLK 20MHz or 10MHz
     config.pixel_format = PIXFORMAT_JPEG; //YUV422,GRAYSCALE,RGB565,JPEG
-    config.frame_size = FRAMESIZE_UXGA;   //UXGA SVGA VGA QVGA Do not use sizes above QVGA when not JPEG
+    config.frame_size = FRAMESIZE_VGA;   //UXGA SVGA VGA QVGA Do not use sizes above QVGA when not JPEG
     config.jpeg_quality = IMAGE_COMPRESSION;
     config.fb_count = 1;//2;                  //if more than one, i2s runs in continuous mode. Use only with JPEG
 
@@ -609,6 +648,10 @@ void setup() {
         }
         s->set_vflip(s, val & EEPROM_ORIENTATION_FLIP_MASK);
         s->set_hmirror(s, val & EEPROM_ORIENTATION_MIRROR_MASK);
+
+        byte fs = EEPROM.read(EEPROM_FRAMESIZE_ADDRESS);
+        framesizeint = (fs & EEPROM_FRAMESIZE_MASK);
+        s->set_framesize(s, (framesize_t)framesizeint);
     }
 
     // Wi-Fi connection - Connecte le module au réseau Wi-Fi
@@ -616,11 +659,14 @@ void setup() {
     // attempt to connect; should it fail, fall back to AP
     WiFiManager().autoConnect(TAG + ESP_getChipId(), "");
     ESP_LOGD(TAG, "Wi-Fi connected ");
-    
+
     // Start streaming web server
     startCameraServer();
 
 #ifdef ENABLE_RTSPSERVER
+    Serial.printf("\n Set size of streamer frame\n");
+    rtspServer.setSize(imWidth[framesizeint], imHeight[framesizeint]);
+    if (framesizeint < 7) { rtspServer.setFrameRate( 75 ); }
     rtspServer.begin();
     ESP_LOGI(TAG, "Camera Stream Ready");
     xTaskCreate([](void *){
