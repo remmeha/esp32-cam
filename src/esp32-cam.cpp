@@ -18,7 +18,8 @@
 //
 #define NO_GLOBAL_ARDUINOOTA
 #include <ArduinoOTA.h>
-#include <WiFiManager.h>  // Need to patch to transfer to cpp some duplicated definitions with WebServer.h, make connectWifi public and change HTTP_HEAD to _HTTP_HEAD
+#include <WiFiManager.h>
+#include <WiFi.h>
 #include <esp_pm.h>
 #include <esp_event_loop.h>
 #include <esp_log.h>
@@ -42,15 +43,15 @@
 #define SERIAL_DEBUG true               // Enable / Disable log - activer / désactiver le journal
 #define ESP_LOG_LEVEL ESP_LOG_NONE      // ESP_LOG_NONE, ESP_LOG_VERBOSE, ESP_LOG_DEBUG, ESP_LOG_ERROR, ESP_LOG_WARM, ESP_LOG_INFO
 
-#define VERSION   "1.06"
+#define VERSION   "1.13"
 
 #define FLASH_PIN 4
 
 #define EEPROM_ORIENTATION_ADDRESS 0
 #define EEPROM_ORIENTATION_FLIP_MASK 0x1
 #define EEPROM_ORIENTATION_MIRROR_MASK 0x2
-#define EEPROM_FRAMESIZE_ADDRESS 1
-#define EEPROM_FRAMESIZE_MASK 0xF  //four bits
+//#define EEPROM_FRAMESIZE_ADDRESS 1
+#define EEPROM_FRAMESIZE_MASK 0x3C  //four bits
 
 // Web server port - port du serveur web
 #define WEB_SERVER_PORT 80
@@ -76,14 +77,14 @@ WebServer server ( WEB_SERVER_PORT );
 #define WATCHDOG_TIMEOUT  (2 * 60 * 1000 * 1000)
 hw_timer_t *watchdog = NULL;
 
-#define IMAGE_COMPRESSION 10   //0-63 lower number means higher quality - Plus de chiffre est petit, meilleure est la qualité de l'image, plus gros est le fichier
-#define CAMERA_SNAPSHOT_PERIOD 100
+#define IMAGE_COMPRESSION 16   //0-63 lower number means higher quality - Plus de chiffre est petit, meilleure est la qualité de l'image, plus gros est le fichier
+#define CAMERA_SNAPSHOT_PERIOD 150
 
 static int imWidth[] =  {160,160,160,240,320,400,640,800,1024,1280,1600 };
 static int imHeight[] = {120,120,120,176,240,296,480,600, 768,1024,1200 };
 int framesizeint = 0;
 
-#define TAG "esp32-cam"
+#define TAG "Suzie camera"
 
 // Uncomment your dev board model - Décommentez votre carte de développement
 // This project was only tested with the AI Thinker Model - le croquis a été testé uniquement avec le modèle AI Thinker
@@ -284,11 +285,12 @@ static void orientation_handler() {
         val |= EEPROM_ORIENTATION_FLIP_MASK;
     }
     byte readVal = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
-    if (readVal != val) {
+    if ((readVal & (EEPROM_ORIENTATION_FLIP_MASK|EEPROM_ORIENTATION_MIRROR_MASK)) != val) {
         sensor_t * s = esp_camera_sensor_get();
         s->set_vflip(s, val & EEPROM_ORIENTATION_FLIP_MASK);
         s->set_hmirror(s, val & EEPROM_ORIENTATION_MIRROR_MASK);
-        EEPROM.write(EEPROM_ORIENTATION_ADDRESS, val);
+        readVal = (readVal & (EEPROM_FRAMESIZE_MASK));
+        EEPROM.write(EEPROM_ORIENTATION_ADDRESS, (readVal | val));
         EEPROM.commit();
     }
     server.send(200);
@@ -300,18 +302,19 @@ static void framesize_handler() {
     //Serial.printf("Received framesize param: %s \n", param);
     Serial.printf("\nString value: %s", params);
     byte val = 0x0;
-    byte readVal = EEPROM.read(EEPROM_FRAMESIZE_ADDRESS);
+    byte readVal = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
     if (params == "1") { val = 0x1; }
     else if (params == "3") { val = 0x3; }
     else if (params == "4") { val = 0x4; }
     else if (params == "5") { val = 0x5; }
     else if (params == "6") { val = 0x6; }
-    //else if (params == "7") { val = 0x7; }
+    else if (params == "7") { val = 0x7; }
     else if (params == "8") { val = 0x8; }
     else if (params == "9") { val = 0x9; }
     else if (params == "10") { val = 0xA; }
-    if ((readVal & EEPROM_FRAMESIZE_MASK) != val) {
-        EEPROM.write(EEPROM_FRAMESIZE_ADDRESS, val);
+    if (((readVal & EEPROM_FRAMESIZE_MASK) >> 2) != val) {
+        readVal = (readVal & (EEPROM_ORIENTATION_FLIP_MASK|EEPROM_ORIENTATION_MIRROR_MASK));
+        EEPROM.write(EEPROM_ORIENTATION_ADDRESS, (readVal | (val << 2)));
         EEPROM.commit();
         Serial.printf("\nRead value: %u", readVal);
         Serial.printf("\nReceived value: %u", val);
@@ -400,7 +403,7 @@ static void usage_handler() {
     static const __FlashStringHelper* info =
 F("<html>"
   "<head>"
-    "<title>esp32-cam - API</title>"
+    "<title>" TAG " - API</title>"
     "<style>"
     "</style>"
   "</head>"
@@ -409,7 +412,7 @@ F("<html>"
     "<ul>"
       "<li>Led on/off/toggle: " URI_FLASH "?action=[on|off|toggle]</li>"
       "<li>Flip/Mirror camera: " URI_ORIENTATION "?mirror=[0|false|1|true]&flip=[0|false|1|true]</li>"
-      "<li>Framesize camera: " URI_FRAMESIZE "?framesize=[0,3-6,8-10] (reboot needed)</li>"
+      "<li>Framesize camera: " URI_FRAMESIZE "?framesize=[0,3-10] (reboot needed)</li>"
       "<li>Snapshot JPEG: " URI_STATIC_JPEG "</li>"
       "<li>Reboot: " URI_REBOOT "</li>"
       "<li>Reset Wifi: " URI_WIFI "</li>"
@@ -424,7 +427,6 @@ F("<html>"
 
 static void status_handler() {
     byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
-    byte fs = EEPROM.read(EEPROM_FRAMESIZE_ADDRESS);
     int64_t time = esp_timer_get_time();
     String info = "{"
     "\"version\":\"" VERSION "\","
@@ -432,7 +434,7 @@ static void status_handler() {
     "\"ledTimer\":\"" + String(MAX(0, int((ledOnTimer - time) / 1000000))) + "\","
     "\"flip\":\"" + String(val&(EEPROM_ORIENTATION_FLIP_MASK)?"1":"0") + "\","
     "\"mirror\":\"" + String(val&(EEPROM_ORIENTATION_MIRROR_MASK)?"1":"0") + "\","
-    "\"framesize\":\"" + (fs&EEPROM_FRAMESIZE_MASK) + "\","
+    "\"framesize\":\"" + ((val&EEPROM_FRAMESIZE_MASK)>>2) + "\","
     "\"ssid\":\"" + WiFi.SSID() + "\","
     "\"rssi\":\"" + String(WiFi.RSSI()) + "\","
     "\"ip\":\"" + WiFi.localIP().toString() + "\","
@@ -451,7 +453,7 @@ static void info_handler() {
   static const __FlashStringHelper* info =
 F("<html>"
   "<head>"
-    "<title>esp32-cam</title>"
+    "<title>" TAG "</title>"
     "<script type=\"text/javascript\">"
       "function invoke(url)"
       "{"
@@ -523,7 +525,7 @@ F("<html>"
             "<br/>"
             "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_REBOOT "\');return false;\">Reboot Device</a><span id=\"reboot\"></span>"
             "<br/>"
-            "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_WIFI "\');return false;\">Reset Device</a>"
+            "<a class=\"link\" href=\"\" onclick=\"invoke(\'" URI_WIFI "\');return false;\">Reset Device (incl Wifi)</a>"
             "<br/>"
             "<a class=\"link\"  href=\"\" onclick=\"invoke(\'" URI_OTA "?action=toggle\');return false;\">Toggle OTA</a><span id=\"ota\"></span>"
             "<br/>"
@@ -581,6 +583,41 @@ void startCameraServer() {
     server.on(URI_USAGE, usage_handler);
     server.on(URI_ROOT, info_handler);
     server.begin();
+}
+
+void ConnectWifi() {
+  WiFi.begin();
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries < 20) {
+      delay(500);
+
+      Serial.print(".");
+      tries = tries + 1;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Entering smartconfig mode");
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.beginSmartConfig();
+
+      //Wait for SmartConfig packet from mobile
+      Serial.println("Waiting for SmartConfig.");
+      while (!WiFi.smartConfigDone() && tries < 1200 ) {
+        delay(500);
+        Serial.print(".|");
+        tries = tries + 1;
+      }
+      if (!WiFi.smartConfigDone()) {
+        Serial.println("No config received, restarting");
+        ESP.restart();
+      }
+    }
+
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("Camera Ready! Use 'http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("' to connect");
 }
 
 void setup() {
@@ -641,7 +678,7 @@ void setup() {
         sensor_t * s = esp_camera_sensor_get();
         EEPROM.begin(1);
         byte val = EEPROM.read(EEPROM_ORIENTATION_ADDRESS);
-        if (val & ~(EEPROM_ORIENTATION_FLIP_MASK|EEPROM_ORIENTATION_MIRROR_MASK)) { // Invalid content
+        if (val & ~(EEPROM_ORIENTATION_FLIP_MASK|EEPROM_ORIENTATION_MIRROR_MASK|EEPROM_FRAMESIZE_MASK)) { // Invalid content
             val = 0; // No flip nor mirror
             EEPROM.write(EEPROM_ORIENTATION_ADDRESS, val);
             EEPROM.commit();
@@ -649,22 +686,23 @@ void setup() {
         s->set_vflip(s, val & EEPROM_ORIENTATION_FLIP_MASK);
         s->set_hmirror(s, val & EEPROM_ORIENTATION_MIRROR_MASK);
 
-        byte fs = EEPROM.read(EEPROM_FRAMESIZE_ADDRESS);
-        framesizeint = (fs & EEPROM_FRAMESIZE_MASK);
+        framesizeint = (val & EEPROM_FRAMESIZE_MASK) >> 2;
         s->set_framesize(s, (framesize_t)framesizeint);
     }
 
     // Wi-Fi connection - Connecte le module au réseau Wi-Fi
     ESP_LOGD(TAG, "Start Wi-Fi connexion ");
     // attempt to connect; should it fail, fall back to AP
-    WiFiManager().autoConnect(TAG + ESP_getChipId(), "");
+    Serial.printf("\n Connecting wifi\n");
+    //WiFiManager().autoConnect(TAG + ESP_getChipId(), "");
+    ConnectWifi();
     ESP_LOGD(TAG, "Wi-Fi connected ");
 
     // Start streaming web server
     startCameraServer();
 
 #ifdef ENABLE_RTSPSERVER
-    Serial.printf("\n Set size of streamer frame\n");
+    Serial.printf("\n Set size of streamer frame %u\n", framesizeint);
     rtspServer.setSize(imWidth[framesizeint], imHeight[framesizeint]);
     if (framesizeint < 7) { rtspServer.setFrameRate( 75 ); }
     rtspServer.begin();
